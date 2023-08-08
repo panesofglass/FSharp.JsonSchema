@@ -5,7 +5,6 @@ open System.Collections.Generic
 open Microsoft.FSharp.Reflection
 open Namotion.Reflection
 open NJsonSchema
-open NJsonSchema.Annotations
 open NJsonSchema.Generation
 
 /// Microsoft.FSharp.Reflection helpers
@@ -28,16 +27,21 @@ module Reflection =
     let isPrimitive (ty: Type) =
         ty.IsPrimitive || ty = typeof<String> || ty = typeof<Decimal>
 
+    let isIntegerEnum (ty: Type) =
+        ty.IsEnum && ty.GetEnumUnderlyingType() = typeof<int>
+
+
 type OptionSchemaProcessor() =
     static let optionTy = typedefof<option<_>>
 
     member this.Process(context: SchemaProcessorContext) =
         if
-            context.Type.IsGenericType
-            && optionTy.Equals(context.Type.GetGenericTypeDefinition())
+            isNull context.Schema.Reference
+            && context.ContextualType.Type.IsGenericType
+            && optionTy.Equals(context.ContextualType.Type.GetGenericTypeDefinition())
         then
             let schema = context.Schema
-            let cases = FSharpType.GetUnionCases(context.Type)
+            let cases = FSharpType.GetUnionCases(context.ContextualType.Type)
 
             let schemaType =
                 [| for case in cases do
@@ -47,7 +51,7 @@ type OptionSchemaProcessor() =
                            let field = case.GetFields() |> Array.head
 
                            let schema =
-                               context.Generator.Generate(field.PropertyType)
+                               context.Generator.Generate(field.PropertyType, context.Resolver)
 
                            match schema.Type with
                            | JsonObjectType.None ->
@@ -70,12 +74,13 @@ type SingleCaseDuSchemaProcessor() =
 
     member this.Process(context: SchemaProcessorContext) =
         if
-            FSharpType.IsUnion(context.Type)
-            && Reflection.allCasesEmpty context.Type
+            isNull context.Schema.Reference
+            && FSharpType.IsUnion(context.ContextualType.Type)
+            && Reflection.allCasesEmpty context.ContextualType.Type
         then
             let schema = context.Schema
             schema.Type <- JsonObjectType.String
-            let cases = FSharpType.GetUnionCases(context.Type)
+            let cases = FSharpType.GetUnionCases(context.ContextualType.Type)
 
             for case in cases do
                 schema.Enumeration.Add(case.Name)
@@ -89,20 +94,19 @@ type MultiCaseDuSchemaProcessor(?casePropertyName) =
 
     member this.Process(context: SchemaProcessorContext) =
         if
-            FSharpType.IsUnion(context.Type)
-            && not (Reflection.allCasesEmpty context.Type)
-            && not (Reflection.isList context.Type)
-            && not (Reflection.isOption context.Type)
+            isNull context.Schema.Reference
+            && FSharpType.IsUnion(context.ContextualType.Type)
+            && not (Reflection.allCasesEmpty context.ContextualType.Type)
+            && not (Reflection.isList context.ContextualType.Type)
+            && not (Reflection.isOption context.ContextualType.Type)
         then
-            let cases = FSharpType.GetUnionCases(context.Type)
+            let cases = FSharpType.GetUnionCases(context.ContextualType.Type)
 
             // Set the core schema definition.
             let schema = context.Schema
             schema.Type <- JsonObjectType.None
             schema.IsAbstract <- false
             schema.AllowAdditionalProperties <- true
-
-            let fieldSchemaCache = Dictionary<Type, JsonSchema>()
 
             // Add schemas for each case.
             for case in cases do
@@ -142,45 +146,39 @@ type MultiCaseDuSchemaProcessor(?casePropertyName) =
                                     string (Char.ToLowerInvariant field.Name.[0])
                                     + field.Name.Substring(1)
 
+                            let generate ( t : Type) =
+                                    let isIntegerEnum = Reflection.isIntegerEnum t
+                                    if context.Resolver.HasSchema(t, isIntegerEnum) then
+                                        context.Resolver.GetSchema(t, isIntegerEnum)
+                                    else
+                                        let s = context.Generator.Generate(t, context.Resolver)
+                                        if (not << Reflection.isPrimitive ) t
+                                             && not (context.Resolver.HasSchema(t, isIntegerEnum))
+                                         then
+                                              context.Resolver.AddSchema(t, isIntegerEnum, s)
+                                        s
+
                             if field.PropertyType.IsGenericType
                                && field.PropertyType.GetGenericTypeDefinition() = typedefof<option<_>> then
                                 let innerTy =
                                     field.PropertyType.GetGenericArguments().[0]
 
-                                let fieldSchema =
-                                    match fieldSchemaCache.TryGetValue innerTy with
-                                    | true, fs -> fs
-                                    | _ -> context.Generator.Generate(innerTy)
+                                let fieldSchema = generate innerTy
 
                                 let prop =
                                     if Reflection.isPrimitive innerTy then
                                         JsonSchemaProperty(Type = fieldSchema.Type)
                                     else
-                                        if not (fieldSchemaCache.ContainsKey innerTy) then
-                                            context.Resolver.AppendSchema(fieldSchema, typeNameHint = innerTy.Name)
-                                            fieldSchemaCache.Add(innerTy, fieldSchema)
-
                                         JsonSchemaProperty(Reference = fieldSchema)
 
                                 s.Properties.Add(camelCaseFieldName, prop)
                             else
-                                let fieldSchema =
-                                    match fieldSchemaCache.TryGetValue field.PropertyType with
-                                    | true, fs -> fs
-                                    | _ -> context.Generator.Generate(field.PropertyType)
+                                let fieldSchema = generate field.PropertyType
 
                                 let prop =
                                     if Reflection.isPrimitive field.PropertyType then
                                         JsonSchemaProperty(Type = fieldSchema.Type, Format = fieldSchema.Format)
                                     else
-                                        if not (fieldSchemaCache.ContainsKey field.PropertyType) then
-                                            context.Resolver.AppendSchema(
-                                                fieldSchema,
-                                                typeNameHint = field.PropertyType.Name
-                                            )
-
-                                            fieldSchemaCache.Add(field.PropertyType, fieldSchema)
-
                                         JsonSchemaProperty(Reference = fieldSchema)
 
                                 s.Properties.Add(camelCaseFieldName, prop)
@@ -194,6 +192,30 @@ type MultiCaseDuSchemaProcessor(?casePropertyName) =
 
     interface ISchemaProcessor with
         member this.Process(context) = this.Process(context)
+
+
+type RecordSchemaProcessor() =
+
+    let isNullableProperty(property: JsonSchemaProperty) =
+        property.Type.HasFlag JsonObjectType.Null
+        || property.OneOf |> Seq.exists (fun s -> s.Type.HasFlag JsonObjectType.Null)
+
+    member this.Process(context: SchemaProcessorContext) =
+        if
+            isNull context.Schema.Reference
+            && FSharpType.IsRecord(context.ContextualType.Type)
+        then
+            let schema = context.Schema
+
+            for KeyValue(propertyName, property) in schema.Properties do
+                 if (not << isNullableProperty) property then
+                    property.IsRequired <- true
+
+    interface ISchemaProcessor with
+        member this.Process(context) = this.Process(context)
+
+
+        
 
 [<Sealed>]
 type internal SchemaNameGenerator() =
@@ -231,6 +253,7 @@ type internal ReflectionService() =
         else
             base.GetDescription(contextualType, defaultReferenceTypeNullHandling, settings)
 
+
 [<AbstractClass; Sealed>]
 type Generator private () =
     static let cache =
@@ -242,12 +265,14 @@ type Generator private () =
                 SerializerOptions = FSharp.Data.Json.DefaultOptions,
                 DefaultReferenceTypeNullHandling = ReferenceTypeNullHandling.NotNull,
                 ReflectionService = ReflectionService(),
-                SchemaNameGenerator = SchemaNameGenerator()
+                SchemaNameGenerator = SchemaNameGenerator(),
+                UseXmlDocumentation = true
             )
 
         settings.SchemaProcessors.Add(OptionSchemaProcessor())
         settings.SchemaProcessors.Add(SingleCaseDuSchemaProcessor())
         settings.SchemaProcessors.Add(MultiCaseDuSchemaProcessor(?casePropertyName = casePropertyName))
+        settings.SchemaProcessors.Add(RecordSchemaProcessor())
         fun ty -> JsonSchema.FromType(ty, settings)
 
     /// Creates a generator using the specified casePropertyName and generationProviders.
